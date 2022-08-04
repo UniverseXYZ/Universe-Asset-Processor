@@ -14,6 +14,9 @@ import Jimp from "jimp";
 import getMediaDimensions from "get-media-dimensions";
 import gifResize from "@gumlet/gif-resize";
 import extractFrames from "ffmpeg-extract-frames";
+import imagemin from "imagemin";
+import imageminWebp from "imagemin-webp";
+import imageminGif2webp from "imagemin-gif2webp";
 
 // TYPES
 import { MimeType } from "./types";
@@ -46,7 +49,7 @@ const fileType = async (url: string) => {
       if (err) reject({ err: 0, msg: "Error with file type request" });
       else {
         try {
-          const detectedType = res.headers["content-type"];
+          let detectedType = res.headers["content-type"];
           if (detectedType) {
             if (detectedType === "application/octet-stream") {
               const stream = got.stream(url);
@@ -55,12 +58,14 @@ const fileType = async (url: string) => {
                 ...mime,
                 contentType: mime!.toString().split("/")[0].toLowerCase(),
               });
-            } else
+            } else {
+              detectedType = detectedType.toLowerCase().replace("jpeg", "jpg");
               resolve({
                 mime: detectedType,
                 contentType: detectedType.split("/")[0].toLowerCase(),
                 ext: detectedType.split("/")[1],
               });
+            }
           } else reject({ err: 1, msg: "No content type specified" });
         } catch {
           reject({ err: 2, msg: "Issue getting file type" });
@@ -91,9 +96,14 @@ const temporaryStore = async (url: string, mimeType: MimeType) => {
   });
 };
 
-const processGif = async (path: string) => {
+const processGif = async (path: string, dim: any) => {
   return new Promise(async (resolve, reject) => {
     try {
+      const dimensions = {
+        width: MAX_GRID_WIDTH,
+        height: (dim.height * MAX_GRID_WIDTH) / dim.width,
+      };
+
       const tempFile = "temp/"
         .concat(crypto.randomBytes(24).toString("hex"))
         .concat(".gif");
@@ -101,8 +111,8 @@ const processGif = async (path: string) => {
 
       const buf = fs.readFileSync(path);
       await gifResize({
-        width: MAX_GRID_WIDTH,
-        optimizationLevel: 3,
+        width: dimensions.width,
+        height: dimensions.height,
       })(buf)
         .then(async (data) => {
           const stream = new Duplex();
@@ -110,9 +120,29 @@ const processGif = async (path: string) => {
           stream.push(null);
           stream.pipe(write);
 
-          stream.once("end", () => {
-            getMediaDimensions(tempFile, "image").then(async (dimensions) => {
-              resolve({ ...dimensions, path: tempFile });
+          stream.once("end", async () => {
+            const res = await imagemin([tempFile], {
+              destination: "temp",
+              plugins: [
+                imageminGif2webp({
+                  quality: 20,
+                  mixed: true,
+                  lossy: true,
+                  method: 0,
+                  minimize: true,
+                  multiThreading: true,
+                }),
+              ],
+            });
+
+            resolve({
+              ...dimensions,
+              path: res[0].destinationPath,
+              mimeType: {
+                mime: "image/webp",
+                contentType: "image",
+                ext: "webp",
+              },
             });
           });
         })
@@ -125,12 +155,45 @@ const processGif = async (path: string) => {
   });
 };
 
-const processImage = async (path: string) => {
+const processWebp = async (path: string, dim: any) => {
+  return new Promise(async (resolve, reject) => {
+    try {
+      const dimensions = {
+        width: MAX_GRID_WIDTH,
+        height: (dim.height * MAX_GRID_WIDTH) / dim.width,
+      };
+      const res = await imagemin([path], {
+        destination: "temp",
+        plugins: [
+          imageminWebp({
+            resize: dimensions,
+            quality: 50,
+          }),
+        ],
+      });
+
+      resolve({
+        ...dimensions,
+        path: res[0].destinationPath,
+        mimeType: {
+          mime: "image/webp",
+          contentType: "image",
+          ext: "webp",
+        },
+      });
+    } catch {
+      reject({ err: 3, msg: "Issue processing webp" });
+    }
+  });
+};
+
+const processImage = async (path: string, ext: string) => {
   return new Promise(async (resolve, reject) => {
     try {
       const tempFile = "temp/"
         .concat(crypto.randomBytes(24).toString("hex"))
-        .concat(".jpg");
+        .concat(".")
+        .concat(ext);
 
       await Jimp.read(path)
         .then(async (image) => {
@@ -141,7 +204,15 @@ const processImage = async (path: string) => {
         });
 
       getMediaDimensions(tempFile, "image").then(async (dimensions) => {
-        resolve({ ...dimensions, path: tempFile });
+        resolve({
+          ...dimensions,
+          path: tempFile,
+          mimeType: {
+            mime: `image/${ext.toLowerCase()}`,
+            contentType: "image",
+            ext: ext.toLowerCase(),
+          },
+        });
       });
     } catch {
       reject({ err: 3, msg: "Issue processing image" });
@@ -152,9 +223,11 @@ const processImage = async (path: string) => {
 const processVideo = async (path: string) => {
   return new Promise(async (resolve, reject) => {
     try {
+      const ext = "jpg";
       const tempFrame = "temp/"
         .concat(crypto.randomBytes(24).toString("hex"))
-        .concat(".jpg");
+        .concat(".")
+        .concat(ext);
 
       await extractFrames({
         input: path,
@@ -163,7 +236,7 @@ const processVideo = async (path: string) => {
         ffmpegPath: process.env.FFMPEG_PATH,
       });
 
-      const smallThumbnail = await processImage(tempFrame);
+      const smallThumbnail = await processImage(tempFrame, ext);
       resolve(smallThumbnail);
     } catch {
       reject({ err: 3, msg: "Issue processing video" });
@@ -188,22 +261,30 @@ const webOptimizer = async (url: string) => {
             handleError(err)
           );
           result = { ...dimensions, web };
-          console.log("========== PROCESSED VIDEO ==========");
         } else if (mimeType.ext === "gif") {
           const dimensions = await getMediaDimensions(tempFile, "image");
-          const web = await processGif(tempFile).catch((err) =>
+          const web = await processGif(tempFile, dimensions).catch((err) =>
             handleError(err)
           );
-          console.log("========== PROCESSED GIF ==========");
           result = { ...dimensions, web };
         } else if (mimeType.contentType === "image") {
+          let web;
           const dimensions = await getMediaDimensions(tempFile, "image");
-          const web = await processImage(tempFile).catch((err) =>
-            handleError(err)
-          );
-          console.log("========== PROCESSED IMAGE ==========");
+          if (mimeType.ext === "webp") {
+            web = await processWebp(tempFile, dimensions).catch((err) =>
+              handleError(err)
+            );
+          } else {
+            web = await processImage(tempFile, mimeType.ext).catch((err) =>
+              handleError(err)
+            );
+          }
           result = { ...dimensions, web };
         }
+
+        console.log(
+          `========== PROCESSED ${mimeType.ext.toUpperCase()} ==========`
+        );
       }
 
       resolve({ ...result, mimeType });
@@ -217,7 +298,7 @@ const webOptimizer = async (url: string) => {
  * 1. CHANGE RUN SCRIPT TO USE DATABASE INSTEAD OF S3 SAMPLE IMAGES
  * 2. DOES NOT NEED TO BE ASYNC
  * 3. STORE ASSET FROM TEMP TO S3 / CDN
- * 4. DELETE ASSET FROM TEMP
+ * 4. DELETE ASSETS FROM TEMP AFTER STORING
  */
 const runScript = async () => {
   s3Client.listObjectsV2(bucketParams, async (err: any, data: any) => {
@@ -225,7 +306,7 @@ const runScript = async () => {
     else {
       let i = 0;
       while (i < data.Contents.length) {
-        console.log("PROCESSING FILE: ", data.Contents[i].Key);
+        console.log("\nPROCESSING FILE: ", data.Contents[i].Key);
         const result = await webOptimizer(
           s3BaseURI.concat(data.Contents[i].Key)
         );
