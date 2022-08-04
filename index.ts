@@ -29,8 +29,11 @@ const s3Client = new S3({
   },
 });
 
-const s3BaseURI = "https://cdn.grants.art/";
-const bucketParams = { Bucket: "grants", Prefix: "test-images" };
+const s3BaseURI = process.env.SPACES_BASE_URI;
+const bucketParams = {
+  Bucket: process.env.SPACES_BUCKET_NAME,
+  Prefix: process.env.SPACES_FOLDER,
+};
 
 const handleError = (err) => {
   console.log("ERROR CODE: ", err.err);
