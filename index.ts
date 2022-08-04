@@ -159,7 +159,7 @@ const processVideo = async (path: string) => {
       await extractFrames({
         input: path,
         output: tempFrame,
-        offsets: [1000],
+        offsets: [1],
         ffmpegPath: process.env.FFMPEG_PATH,
       });
 
