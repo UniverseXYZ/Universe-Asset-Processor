@@ -34,13 +34,13 @@ This is an example result object that is returned for each processed asset from 
 
 ```
 {
-  width: 2000,
-  height: 2000,
-  duration: 17.666667,
+  width: 1280,
+  height: 720,
+  duration: 51.233333,
   web: {
     width: 600,
-    height: 600,
-    path: 'temp/a6180c8f8225cbee7d22f32ab78c737af997be8db6276e1e.jpg'
-  }
-}
+    height: 338,
+    path: 'temp/75e66c9c14faf76544ef2f299300899cb7ed8b4f1c5e0c9e.jpg'
+  },
+  mimeType: { mime: 'video/mp4', contentType: 'video', ext: 'mp4' }
 ```

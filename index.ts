@@ -206,7 +206,7 @@ const webOptimizer = async (url: string) => {
         }
       }
 
-      resolve(result);
+      resolve({ ...result, mimeType });
     } catch {
       reject({ err: 5, msg: "Issue processing file" });
     }
