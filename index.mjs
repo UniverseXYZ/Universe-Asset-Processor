@@ -1,5 +1,5 @@
-import dotenv from "dotenv";
-dotenv.config();
+// import dotenv from "dotenv";
+// dotenv.config();
 
 import fs from "fs";
 import got from "got";
@@ -57,15 +57,30 @@ const NFTSchema = new Schema({
   webMimeType: String,
   webContentType: String,
   webExt: String,
+  audioAsset: String,
+  audioMimeType: String,
+  audioExt: String,
 });
 
 const NFT = model("NFT", NFTSchema);
 
-let s3Client;
-let FFMPEG_PATH;
-let EFS_PATH;
+const FFMPEG_PATH = process.env.FFMPEG_PATH;
+const FILESYSTEM_PATH = process.env.FILESYSTEM_PATH;
 
 const MAX_GRID_WIDTH = 600;
+
+const s3Client = new S3({
+  region: process.env.S3_REGION,
+  credentials: {
+    accessKeyId: process.env.S3_KEY,
+    secretAccessKey: process.env.S3_SECRET,
+  },
+});
+
+mongoose.connect(process.env.MONGO_DRIVER, {
+  useUnifiedTopology: true,
+  useNewUrlParser: true,
+});
 
 const handleError = (err) => {
   console.log("ERROR CODE: ", err.err);
@@ -74,7 +89,10 @@ const handleError = (err) => {
 
 const ProtocolParser = (url) => {
   if (url.slice(0, 7) === "ipfs://") {
-    return `https://ipfs.io/ipfs/${url.substring(7, url.length)}`;
+    return `https://alchemy.mypinata.cloud/ipfs/${url.substring(
+      7,
+      url.length
+    )}`;
   } else if (url.slice(0, 5) === "ar://") {
     return `https://arweave.net/${url.substring(5, url.length)}`;
   } else return url;
@@ -116,7 +134,9 @@ const fileType = async (url) => {
 const temporaryStore = async (url, mimeType) => {
   return new Promise(async (resolve, reject) => {
     try {
-      const fileName = EFS_PATH.concat(crypto.randomBytes(24).toString("hex"))
+      const fileName = FILESYSTEM_PATH.concat(
+        crypto.randomBytes(24).toString("hex")
+      )
         .concat(".")
         .concat(mimeType.ext);
 
@@ -146,7 +166,7 @@ const processGif = async (path, dim) => {
         height: (dim.height * MAX_GRID_WIDTH) / dim.width,
       };
 
-      const tempFile = EFS_PATH.concat(
+      const tempFile = FILESYSTEM_PATH.concat(
         crypto.randomBytes(24).toString("hex")
       ).concat(".gif");
       const write = fs.createWriteStream(tempFile);
@@ -232,7 +252,9 @@ const processWebp = async (path, dim) => {
 const processImage = async (path, ext) => {
   return new Promise(async (resolve, reject) => {
     try {
-      const tempFile = EFS_PATH.concat(crypto.randomBytes(24).toString("hex"))
+      const tempFile = FILESYSTEM_PATH.concat(
+        crypto.randomBytes(24).toString("hex")
+      )
         .concat(".")
         .concat(ext);
 
@@ -265,7 +287,9 @@ const processVideo = async (path) => {
   return new Promise(async (resolve, reject) => {
     try {
       const ext = "jpg";
-      const tempFrame = EFS_PATH.concat(crypto.randomBytes(24).toString("hex"))
+      const tempFrame = FILESYSTEM_PATH.concat(
+        crypto.randomBytes(24).toString("hex")
+      )
         .concat(".")
         .concat(ext);
 
@@ -297,11 +321,12 @@ const webOptimizer = async (url, event) => {
       if (mimeType) {
         tempFile = await temporaryStore(url, mimeType);
 
-        const fileStream = fs.createReadStream(tempFile);
+        const fileStream = fs.readFileSync(tempFile);
         const uploadParams = {
           Bucket: process.env.S3_BUCKET_NAME,
-          Key: `raw-assets/${event.id}`,
+          Key: `${process.env.S3_RAW_ASSET_FOLDER}/${event.id}.${mimeType.ext}`,
           Body: fileStream,
+          ACL: "public-read",
         };
 
         await s3Client.send(new PutObjectCommand(uploadParams));
@@ -345,33 +370,39 @@ const webOptimizer = async (url, event) => {
   }).catch((err) => handleError(err));
 };
 
-const initLambda = async () => {
-  return new Promise((resolve) => {
-    s3Client = new S3({
-      region: "us-east-1",
-      credentials: {
-        accessKeyId: process.env.S3_KEY,
-        secretAccessKey: process.env.S3_SECRET,
-      },
-    });
+const audioOptimizer = async (url, event) => {
+  return new Promise(async (resolve, reject) => {
+    let tempFile;
+    try {
+      let mimeType = await fileType(url).catch((err) => handleError(err));
 
-    FFMPEG_PATH = process.env.FFMPEG_PATH;
-    EFS_PATH = process.env.EFS_PATH;
+      if (mimeType && mimeType.contentType === "audio") {
+        tempFile = await temporaryStore(url, mimeType);
 
-    mongoose
-      .connect(process.env.MONGO_DRIVER, {
-        useUnifiedTopology: true,
-        useNewUrlParser: true,
-      })
-      .then(() => {
-        resolve();
-      });
-  });
+        const fileStream = fs.readFileSync(tempFile);
+        const uploadParams = {
+          Bucket: process.env.S3_BUCKET_NAME,
+          Key: `${process.env.S3_AUDIO_ASSET_FOLDER}/${event.id}.${mimeType.ext}`,
+          Body: fileStream,
+          ACL: "public-read",
+        };
+
+        await s3Client.send(new PutObjectCommand(uploadParams));
+
+        console.log(
+          `========== PROCESSED ${mimeType.ext.toUpperCase()} ==========`
+        );
+      }
+
+      resolve({ path: tempFile, mimeType });
+    } catch (err) {
+      console.log("ERROR", err);
+      reject({ err: 5, msg: "Issue processing file" });
+    }
+  }).catch((err) => handleError(err));
 };
 
 export const handler = async function (event, context, callback) {
-  await initLambda();
-
   try {
     const nft = await NFT.findById(event.id).exec();
     console.log("PROCESSING: ", event.id);
@@ -380,26 +411,36 @@ export const handler = async function (event, context, callback) {
         ProtocolParser(nft.originalAsset),
         event
       );
+
+      let audio;
+      if (nft.originalAudio) {
+        audio = await audioOptimizer(ProtocolParser(nft.originalAudio), event);
+      }
+
       console.log(result);
+      if (audio) console.log(audio);
       if (result) {
         if (result.web && result.web.path) {
-          const fileStream = fs.createReadStream(result.web.path);
+          const fileStream = fs.readFileSync(result.web.path);
           const uploadParams = {
             Bucket: process.env.S3_BUCKET_NAME,
-            Key: `web-assets/${event.id}`,
+            Key: `${process.env.S3_WEB_ASSET_FOLDER}/${event.id}.${result.web.mimeType.ext}`,
             Body: fileStream,
+            ACL: "public-read",
           };
+
           await s3Client.send(new PutObjectCommand(uploadParams));
           await fsPromise.unlink(result.web.path);
         }
 
-        if (result.path) await fsPromise.unlink(result.path);
-
         if (result.width) nft.width = result.width;
         if (result.height) nft.height = result.height;
         if (result.duration) nft.duration = result.duration;
-        if (result.path) nft.asset = `raw-assets/${event.id}`;
         if (result.mimeType) {
+          if (result.path) {
+            await fsPromise.unlink(result.path);
+            nft.asset = `${process.env.S3_RAW_ASSET_FOLDER}/${event.id}.${result.mimeType.ext}`;
+          }
           if (result.mimeType.mime) nft.mimeType = result.mimeType.mime;
           if (result.mimeType.contentType)
             nft.contentType = result.mimeType.contentType;
@@ -408,8 +449,9 @@ export const handler = async function (event, context, callback) {
         if (result.web) {
           if (result.web.width) nft.webWidth = result.web.width;
           if (result.web.height) nft.webHeight = result.web.height;
-          if (result.web.path) nft.webAsset = `web-assets/${event.id}`;
           if (result.web.mimeType) {
+            if (result.web.path)
+              nft.webAsset = `${process.env.S3_WEB_ASSET_FOLDER}/${event.id}.${result.web.mimeType.ext}`;
             if (result.web.mimeType.mime)
               nft.webMimeType = result.web.mimeType.mime;
             if (result.web.mimeType.contentType)
@@ -417,9 +459,20 @@ export const handler = async function (event, context, callback) {
             if (result.web.mimeType.ext) nft.webExt = result.web.mimeType.ext;
           }
         }
-        context.callbackWaitsForEmptyEventLoop = false;
+        if (audio) {
+          if (audio.path) {
+            await fsPromise.unlink(audio.path);
+            nft.audioAsset = `${process.env.S3_AUDIO_ASSET_FOLDER}/${event.id}.${result.mimeType.ext}`;
+          }
+          if (audio.mimeType) {
+            if (audio.mimeType.mime) nft.audioMimeType = audio.mimeType.mime;
+            if (audio.mimeType.ext) nft.audioExt = audio.mimeType.ext;
+          }
+        }
+
         await nft.save();
-        await mongoose.disconnect();
+
+        context.callbackWaitsForEmptyEventLoop = false;
         return callback(null, {
           statusCode: 200,
           body: "Success",
