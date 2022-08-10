@@ -11,13 +11,8 @@ import { S3, PutObjectCommand } from "@aws-sdk/client-s3";
 
 // PROCESSING TOOLS
 import { fileTypeFromStream } from "file-type";
-import { Duplex } from "stream";
-import Jimp from "jimp";
-import gifResize from "@gumlet/gif-resize";
+import sharp from "sharp";
 import extractFrames from "ffmpeg-extract-frames";
-import imagemin from "imagemin";
-import imageminWebp from "imagemin-webp";
-import imageminGif2webp from "imagemin-gif2webp";
 import imageSizer from "image-size";
 const fsPromise = fs.promises;
 const imageSize = promisify(imageSizer);
@@ -112,7 +107,9 @@ const fileType = async (url) => {
               resolve({
                 ...mime,
                 contentType:
-                  mime && mime.toString().split("/")[0].toLowerCase(),
+                  mime && mime.mime
+                    ? mime.mime.toString().split("/")[0].toLowerCase()
+                    : "",
               });
             } else {
               detectedType = detectedType.toLowerCase().replace("jpeg", "jpg");
@@ -158,111 +155,21 @@ const temporaryStore = async (url, mimeType) => {
   });
 };
 
-const processGif = async (path, dim) => {
+const processGif = async (path, ext) => {
   return new Promise(async (resolve, reject) => {
     try {
-      const dimensions = {
-        width: MAX_GRID_WIDTH,
-        height: (dim.height * MAX_GRID_WIDTH) / dim.width,
-      };
-
-      const tempFile = FILESYSTEM_PATH.concat(
-        crypto.randomBytes(24).toString("hex")
-      ).concat(".gif");
-      const write = fs.createWriteStream(tempFile);
-
-      const buf = fs.readFileSync(path);
-      await gifResize({
-        width: dimensions.width,
-        height: dimensions.height,
-      })(buf)
-        .then(async (data) => {
-          const stream = new Duplex();
-          stream.push(data);
-          stream.push(null);
-          stream.pipe(write);
-
-          stream.once("end", async () => {
-            const res = await imagemin([tempFile], {
-              destination: "temp",
-              plugins: [
-                imageminGif2webp({
-                  quality: 20,
-                  mixed: true,
-                  lossy: true,
-                  method: 0,
-                  minimize: true,
-                  multiThreading: true,
-                }),
-              ],
-            });
-
-            resolve({
-              ...dimensions,
-              path: res[0].destinationPath,
-              mimeType: {
-                mime: "image/webp",
-                contentType: "image",
-                ext: "webp",
-              },
-            });
-          });
-        })
-        .catch(() => {
-          reject({ err: 3, msg: "Issue reading gif" });
-        });
-    } catch {
-      reject({ err: 3, msg: "Issue processing gif" });
-    }
-  });
-};
-
-const processWebp = async (path, dim) => {
-  return new Promise(async (resolve, reject) => {
-    try {
-      const dimensions = {
-        width: MAX_GRID_WIDTH,
-        height: (dim.height * MAX_GRID_WIDTH) / dim.width,
-      };
-      const res = await imagemin([path], {
-        destination: "temp",
-        plugins: [
-          imageminWebp({
-            resize: dimensions,
-            quality: 50,
-          }),
-        ],
-      });
-
-      resolve({
-        ...dimensions,
-        path: res[0].destinationPath,
-        mimeType: {
-          mime: "image/webp",
-          contentType: "image",
-          ext: "webp",
-        },
-      });
-    } catch {
-      reject({ err: 3, msg: "Issue processing webp" });
-    }
-  });
-};
-
-const processImage = async (path, ext) => {
-  return new Promise(async (resolve, reject) => {
-    try {
+      ext = "webp";
       const tempFile = FILESYSTEM_PATH.concat(
         crypto.randomBytes(24).toString("hex")
       )
         .concat(".")
         .concat(ext);
 
-      await Jimp.read(path)
-        .then(async (image) => {
-          await image.resize(MAX_GRID_WIDTH, Jimp.AUTO).writeAsync(tempFile);
-        })
-        .catch(() => {
+      await sharp(path, { animated: true, pages: -1 })
+        .resize({ width: MAX_GRID_WIDTH })
+        .toFile(tempFile)
+        .catch((err) => {
+          console.log(err);
           reject({ err: 4, msg: "Issue reading temp image" });
         });
 
@@ -277,7 +184,43 @@ const processImage = async (path, ext) => {
           },
         });
       });
-    } catch {
+    } catch (err) {
+      console.log("ERROR", err);
+      reject({ err: 3, msg: "Issue processing image" });
+    }
+  });
+};
+
+const processImage = async (path, ext) => {
+  return new Promise(async (resolve, reject) => {
+    try {
+      const tempFile = FILESYSTEM_PATH.concat(
+        crypto.randomBytes(24).toString("hex")
+      )
+        .concat(".")
+        .concat(ext);
+
+      await sharp(path)
+        .resize({ width: MAX_GRID_WIDTH })
+        .toFile(tempFile)
+        .catch((err) => {
+          console.log(err);
+          reject({ err: 4, msg: "Issue reading temp image" });
+        });
+
+      imageSize(tempFile).then(async (dimensions) => {
+        resolve({
+          ...dimensions,
+          path: tempFile,
+          mimeType: {
+            mime: `image/${ext.toLowerCase()}`,
+            contentType: "image",
+            ext: ext.toLowerCase(),
+          },
+        });
+      });
+    } catch (err) {
+      console.log("ERROR", err);
       reject({ err: 3, msg: "Issue processing image" });
     }
   });
@@ -336,17 +279,11 @@ const webOptimizer = async (url, event) => {
             handleError(err)
           );
           result = res;
-        } else if (mimeType.ext === "gif") {
-          const dimensions = await imageSize(tempFile);
-          const web = await processGif(tempFile, dimensions).catch((err) =>
-            handleError(err)
-          );
-          result = { ...dimensions, web };
         } else if (mimeType.contentType === "image") {
           let web;
           const dimensions = await imageSize(tempFile);
-          if (mimeType.ext === "webp") {
-            web = await processWebp(tempFile, dimensions).catch((err) =>
+          if (mimeType.ext === "gif") {
+            web = await processGif(tempFile, mimeType.ext).catch((err) =>
               handleError(err)
             );
           } else {
