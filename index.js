@@ -1,15 +1,19 @@
 "use strict";
+import stream from "stream";
+import sharp from "sharp";
+import mime from "mime";
+import AWS from "aws-sdk";
+import extractFrames from "ffmpeg-extract-frames";
+import fs from "fs";
+import crypto from "crypto";
+import dotenv from "dotenv";
+import util from "util";
+import gifsicle from "gifsicle";
+import { execFile } from "node:child_process"
 
-const stream = require("stream"),
-    sharp = require("sharp"),
-    mime = require("mime/lite"),
-    AWS = require("aws-sdk"),
-    extractFrames = require("ffmpeg-extract-frames"),
-    fs = require("fs"),
-    crypto = require("crypto"),
-    dotenv = require("dotenv");
-    
+const execFilePromise = util.promisify(execFile);
 const fsPromise = fs.promises;
+
 dotenv.config();
 // aws config
 AWS.config.update({
@@ -25,7 +29,7 @@ const sizes = [
   "1280w", // largest web image
 ];
 
-exports.handler = async (event) => {
+export const handler = async (event) => {
     // read key from querystring
     let key = event.queryStringParameters.key;
     const key_components = key.split("/");
@@ -76,15 +80,34 @@ exports.handler = async (event) => {
 
     // 1. Check media type
     const extension = file.split(".").pop();
-    let isVideo = false
+    let isVideo = false;
+    let isGif = false;
+
     if (['mp4', 'mov'].find(ext => ext === extension)) {
       key = key.replace(file, 'thumbnail.jpg');
       isVideo = true;
     }
 
-    // 2. Check if image exists
+    if (extension.includes('gif')) {
+      isGif = true;
+      switch (params.width) {
+        case 480:
+          params.loss = '80'
+          break;
+        case 640:
+          params.loss = '70'
+          break;
+        case 1280:
+          params.loss = '60'
+          break;
+        default:
+          params.loss = '80'
+          break;
+      }
+      console.log(`Loss is set to: ${params.loss}`);
+    }
 
-    // check if target key already exists
+    // 2. Check if image exists
     var target = null;
     await s3
         .headObject({
@@ -112,15 +135,73 @@ exports.handler = async (event) => {
     key_components.push(file);
     if (isVideo) {
       return await processVideo(key_components, params, key, extension);
+    } else if(isGif) {
+      return await processGif(key_components,params, key, extension);
     } else {
       const imageUrl = key_components.join("/");
       return await processS3Image(imageUrl, params, key, extension);
     }
 };
 
+const processGif = async (key_components, params, key, extension) => {
+  try {
+    const fileName = process.env.FILESYSTEM_PATH.concat(
+      crypto.randomBytes(24).toString("hex")
+    )
+    .concat(".")
+    .concat(extension);
+
+
+    const tempFile = await temporaryStore(key_components.join('/'), fileName, process.env.IMAGES_BUCKET);
+
+    const optimizedFile = process.env.FILESYSTEM_PATH.concat(
+      crypto.randomBytes(24).toString("hex")
+    )
+    .concat('optimized')
+    .concat('.gif');
+
+    await execFilePromise(gifsicle, ['-O3', `--lossy=${params.loss}`, '-o', optimizedFile, tempFile]);
+
+    console.log('Image minified!');
+
+    const readStream = fs.createReadStream(optimizedFile);
+    const { writeStream, success } = putS3Stream(process.env.IMAGES_BUCKET, key);
+
+    // trigger stream
+    readStream.pipe(writeStream);
+
+    // wait for the stream
+    await success;
+    await Promise.all([
+      fsPromise.unlink(optimizedFile),
+      fsPromise.unlink(tempFile)
+    ]);
+
+    // 301 redirect to new image
+    console.log('Successfully processed gif!');
+    return {
+      statusCode: 301,
+      headers: {
+          location: process.env.CDN_URL + "/" + key,
+      },
+      body: "",
+    };
+
+    } catch (err) {
+    console.error("ERROR", err);
+    return { err: 3, msg: "Issue processing gif" };
+  }
+}
+
 const processVideo = async (key_components, params, key, extension) => {
   try {
-    const tempFile = await temporaryStore(key_components.join('/'), extension);
+    const fileName = process.env.FILESYSTEM_PATH.concat(
+      crypto.randomBytes(24).toString("hex")
+    )
+      .concat(".")
+      .concat(extension);
+
+    const tempFile = await temporaryStore(key_components.join('/'), fileName, process.env.VIDEOS_BUCKET);
 
     const tempFrame = process.env.FILESYSTEM_PATH.concat(
       crypto.randomBytes(24).toString("hex")
@@ -144,16 +225,11 @@ const processVideo = async (key_components, params, key, extension) => {
   }
 };
 // RESEARCH: DOWNLOAD ONLY FIRST FEW FRAMES
-const temporaryStore = async (url, extension) => {
+const temporaryStore = async (url, fileName, bucket) => {
   return new Promise(async (resolve, reject) => {
     try {
-      const fileName = process.env.FILESYSTEM_PATH.concat(
-        crypto.randomBytes(24).toString("hex")
-      )
-        .concat(".")
-        .concat(extension);
 
-      const readStream = await getS3Stream(process.env.VIDEOS_BUCKET, url)
+      const readStream = await getS3Stream(bucket, url)
 
       const tempFile = fs.createWriteStream(fileName);
       readStream.pipe(tempFile);
@@ -180,6 +256,7 @@ const processThumbnnail = async (path, params, key) => {
     await success;
     await fsPromise.unlink(path);
     // 301 redirect to new image
+    console.log('Successfully processed video thumbnail!');
     return {
       statusCode: 301,
       headers: {
@@ -190,19 +267,15 @@ const processThumbnnail = async (path, params, key) => {
 
   } catch (err) {
     console.log("ERROR", err);
-    return { err: 3, msg: "Issue processing image" };
+    return { err: 3, msg: "Issue processing thumbnail" };
   }
 };
 
-const processS3Image = async (imageUrl, params, key, extension) => {
+const processS3Image = async (imageUrl, params, key) => {
   try {
     const readStream = getS3Stream(process.env.IMAGES_BUCKET, imageUrl);
     let resizeStream = null;
-    if (extension === 'gif') {
-      resizeStream = stream2SharpGif(params);
-    } else {
-      resizeStream = stream2SharpImage(params);
-    }
+    resizeStream = stream2SharpImage(params);
     const { writeStream, success } = putS3Stream(process.env.IMAGES_BUCKET, key);
 
     // trigger stream
@@ -212,6 +285,7 @@ const processS3Image = async (imageUrl, params, key, extension) => {
     await success;
 
     // 301 redirect to new image
+    console.log('Successfully processed image!');
     return {
         statusCode: 301,
         headers: {
@@ -260,12 +334,4 @@ const stream2SharpImage = (params) => {
             withoutEnlargement: true,
         })
     );
-};
-
-const stream2SharpGif = (params) => {
-  return sharp({ animated: true }).resize(
-      Object.assign(params, {
-          withoutEnlargement: true,
-      })
-  ).gif();
 };
